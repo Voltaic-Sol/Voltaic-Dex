@@ -1,0 +1,44 @@
+.anchor
+.DS_Store
+target
+**/*.rs.bk
+node_modules
+test-ledger
+.yarn
+
+# Editor / OS
+.vscode/
+.idea/
+Thumbs.db
+
+# Environment / secrets
+.env
+.env.*
+.env.local
+.envrc
+.secrets
+*.secret
+secrets.json
+
+# Keypairs, private keys and certs
+*-keypair.json
+*.key
+*.pem
+*.pub
+
+# Build / artifacts (explicit)
+/dist/
+build/
+*.log
+
+# Anchor / Solana generated artifacts
+target/**
+**/deploy/*.json
+
+# Typescript / npm
+npm-debug.log
+yarn-error.log
+
+# Ignore generated idl/types if you prefer not to track them (optional)
+# idl/
+# types/
