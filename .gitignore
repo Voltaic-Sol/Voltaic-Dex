@@ -29,6 +29,7 @@ secrets.json
 # Build / artifacts (explicit)
 /dist/
 build/
+.claude
 *.log
 
 # Anchor / Solana generated artifacts

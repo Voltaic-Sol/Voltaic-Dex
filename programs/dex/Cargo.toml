@@ -14,18 +14,19 @@ cpi = ["no-entrypoint"]
 no-entrypoint = []
 no-idl = []
 no-log-ix-name = []
-idl-build = ["anchor-lang/idl-build"]
+idl-build = [
+  "anchor-spl/idl-build"
+]
 anchor-debug = []
 custom-heap = []
 custom-panic = []
 
 [dependencies]
-anchor-lang = { version = "0.31.0", features = ["init-if-needed"] }
-anchor-spl  = { version = "0.31.0", features = ["token", "associated_token", "idl-build"] }
+anchor-lang = "0.31.0"
+anchor-spl = "0.31.0"
 
-
-
-
+spl-token = "6.0.0"
+spl-token-2022 = "6.0.0"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }

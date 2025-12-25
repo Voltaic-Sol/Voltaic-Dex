@@ -7,8 +7,12 @@ use anchor_spl::token_2022 as spl_token_2022;
 use anchor_spl::token_interface::{
     self, Burn, Mint, MintTo, TokenAccount, TokenInterface, TransferChecked,
 };
+use spl_token_2022::spl_token_2022::{
+    extension::{BaseStateWithExtensions, ExtensionType, StateWithExtensions},
+    state::Mint as Token2022Mint,
+};
 
-declare_id!("FCrSSe5yTaL8svSdnBxFoDexWBv1gbGcJrNCF7gtE3UT");
+declare_id!("Evyyu2P24aSwxATkM93k8ZBJroBu8HarnDFseuNE234J");
 
 // =============================
 // SEEDS + CONSTANTS
@@ -64,6 +68,25 @@ pub mod dex {
             DexError::WrongTokenProgram
         );
 
+        // If Token-2022, validate extensions
+        if ctx.accounts.token_program_a.key() == spl_token_2022::ID {
+            validate_token_2022_mint(
+                &ctx.accounts.mint_a.to_account_info()
+            )?;
+        }
+
+        if ctx.accounts.token_program_b.key() == spl_token_2022::ID {
+            validate_token_2022_mint(
+                &ctx.accounts.mint_b.to_account_info()
+            )?;
+        }
+
+        if ctx.accounts.lp_token_program.key() == spl_token_2022::ID {
+            validate_token_2022_mint(
+                &ctx.accounts.lp_mint.to_account_info()
+            )?;
+        }
+
         // IMPORTANT: lp_mint is init'd in account constraints; reload before reading fields
         ctx.accounts.lp_mint.reload()?;
 
@@ -92,6 +115,7 @@ pub mod dex {
 
         pool.lp_mint = ctx.accounts.lp_mint.key();
         pool.lp_token_program = ctx.accounts.lp_token_program.key();
+        pool.lp_vault = ctx.accounts.lp_vault.key();
 
         pool.fee_bps = fee_bps;
         pool.whitelist_required = whitelist_required;
@@ -114,8 +138,9 @@ pub mod dex {
         Ok(())
     }
 
-    pub fn whitelist_remove(_ctx: Context<WhitelistRemove>) -> Result<()> {
-        // close = authority handles rent reclaim
+    pub fn whitelist_remove(ctx: Context<WhitelistRemove>) -> Result<()> {
+        // ✅ Only admin can remove entries (prevents DoS + rent theft)
+        only_admin(&ctx.accounts.pool, &ctx.accounts.authority)?;
         Ok(())
     }
 
@@ -154,6 +179,10 @@ pub mod dex {
             &ctx.accounts.lp_token_program,
         )?;
 
+        require_token_account_program(&ctx.accounts.user_ata_a, &ctx.accounts.token_program_a)?;
+        require_token_account_program(&ctx.accounts.user_ata_b, &ctx.accounts.token_program_b)?;
+        require_token_account_program(&ctx.accounts.user_lp_ata, &ctx.accounts.lp_token_program)?;
+
         enforce_pool_invariants(
             &ctx.accounts.pool,
             &ctx.accounts.pool_authority,
@@ -162,7 +191,11 @@ pub mod dex {
             &ctx.accounts.vault_a,
             &ctx.accounts.vault_b,
             &ctx.accounts.lp_mint,
-        )?;
+            &ctx.accounts.lp_vault,
+            &ctx.accounts.token_program_a,
+            &ctx.accounts.token_program_b,
+            &ctx.accounts.lp_token_program,
+        )?;        
 
         // Optional whitelist PDA (validated manually if required)
         validate_whitelist_if_required(
@@ -307,7 +340,11 @@ pub mod dex {
             &ctx.accounts.lp_token_program,
         )?;
 
-        enforce_pool_invariants(
+        require_token_account_program(&ctx.accounts.user_ata_a, &ctx.accounts.token_program_a)?;
+        require_token_account_program(&ctx.accounts.user_ata_b, &ctx.accounts.token_program_b)?;
+        require_token_account_program(&ctx.accounts.user_lp_ata, &ctx.accounts.lp_token_program)?;
+
+        enforce_pool_invariants_lite(
             &ctx.accounts.pool,
             &ctx.accounts.pool_authority,
             &ctx.accounts.mint_a,
@@ -315,7 +352,11 @@ pub mod dex {
             &ctx.accounts.vault_a,
             &ctx.accounts.vault_b,
             &ctx.accounts.lp_mint,
+            &ctx.accounts.token_program_a,
+            &ctx.accounts.token_program_b,
+            &ctx.accounts.lp_token_program,
         )?;
+
 
         validate_whitelist_if_required(
             &ctx.accounts.pool,
@@ -411,8 +452,11 @@ pub mod dex {
             &ctx.accounts.token_program_b,
             &ctx.accounts.lp_token_program,
         )?;
+        
+        require_token_account_program(&ctx.accounts.user_ata_a, &ctx.accounts.token_program_a)?;
+        require_token_account_program(&ctx.accounts.user_ata_b, &ctx.accounts.token_program_b)?;
 
-        enforce_pool_invariants(
+        enforce_pool_invariants_lite(
             &ctx.accounts.pool,
             &ctx.accounts.pool_authority,
             &ctx.accounts.mint_a,
@@ -420,6 +464,9 @@ pub mod dex {
             &ctx.accounts.vault_a,
             &ctx.accounts.vault_b,
             &ctx.accounts.lp_mint,
+            &ctx.accounts.token_program_a,
+            &ctx.accounts.token_program_b,
+            &ctx.accounts.lp_token_program,
         )?;
 
         validate_whitelist_if_required(
@@ -528,49 +575,6 @@ pub mod dex {
                 &ctx.accounts.pool_authority,
                 &ctx.accounts.mint_a,
                 amount_out,
-                signer_seeds,
-            )?;
-        }
-
-        Ok(())
-    }
-
-    pub fn emergency_drain(
-        ctx: Context<EmergencyDrain>,
-        amount: u64,
-        drain_a: bool,
-    ) -> Result<()> {
-        only_admin(&ctx.accounts.pool, &ctx.accounts.authority)?;
-        require!(amount > 0, DexError::InvalidAmount);
-
-        require_supported_token_program(&ctx.accounts.token_program_a.key())?;
-        require_supported_token_program(&ctx.accounts.token_program_b.key())?;
-
-        let pool_key = ctx.accounts.pool.key();
-        let signer_seeds: &[&[u8]] = &[
-            AUTH_SEED,
-            pool_key.as_ref(),
-            &[ctx.accounts.pool.bump_authority],
-        ];
-
-        if drain_a {
-            transfer_checked_any_signed(
-                &ctx.accounts.token_program_a,
-                &ctx.accounts.vault_a,
-                &ctx.accounts.dest_ata_a,
-                &ctx.accounts.pool_authority,
-                &ctx.accounts.mint_a,
-                amount,
-                signer_seeds,
-            )?;
-        } else {
-            transfer_checked_any_signed(
-                &ctx.accounts.token_program_b,
-                &ctx.accounts.vault_b,
-                &ctx.accounts.dest_ata_b,
-                &ctx.accounts.pool_authority,
-                &ctx.accounts.mint_b,
-                amount,
                 signer_seeds,
             )?;
         }
@@ -687,7 +691,11 @@ pub struct WhitelistAdd<'info> {
 pub struct WhitelistRemove<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
-    #[account(mut)]
+
+    #[account(
+        mut,
+        constraint = pool.admin == authority.key() @ DexError::Unauthorized
+    )]
     pub pool: Account<'info, Pool>,
 
     /// CHECK: wallet being removed
@@ -730,11 +738,16 @@ pub struct AddLiquidity<'info> {
         has_one = vault_a @ DexError::InvalidVault,
         has_one = vault_b @ DexError::InvalidVault,
         has_one = lp_mint @ DexError::InvalidLpMint,
+        has_one = lp_vault @ DexError::InvalidLpVault,
         constraint = pool.authority == pool_authority.key() @ DexError::InvalidAuthority
     )]
     pub pool: Account<'info, Pool>,
 
     /// CHECK: PDA authority signer
+    #[account(
+        seeds = [AUTH_SEED, pool.key().as_ref()],
+        bump = pool.bump_authority
+    )]
     pub pool_authority: UncheckedAccount<'info>,
 
     pub mint_a: Box<InterfaceAccount<'info, Mint>>,
@@ -748,8 +761,16 @@ pub struct AddLiquidity<'info> {
     #[account(mut)]
     pub lp_mint: Box<InterfaceAccount<'info, Mint>>,
 
-    #[account(mut)]
+    // ✅ MUST be the canonical ATA owned by pool_authority for lp_mint
+    // Prevents attacker passing their own token account and stealing MIN_LP_LOCK
+    #[account(
+        mut,
+        associated_token::mint = lp_mint,
+        associated_token::authority = pool_authority,
+        associated_token::token_program = lp_token_program
+    )]
     pub lp_vault: Box<InterfaceAccount<'info, TokenAccount>>,
+
 
     #[account(
         mut,
@@ -804,6 +825,10 @@ pub struct RemoveLiquidity<'info> {
     pub pool: Account<'info, Pool>,
 
     /// CHECK: PDA authority signer
+    #[account(
+        seeds = [AUTH_SEED, pool.key().as_ref()],
+        bump = pool.bump_authority
+    )]
     pub pool_authority: UncheckedAccount<'info>,
 
     pub mint_a: Box<InterfaceAccount<'info, Mint>>,
@@ -869,6 +894,10 @@ pub struct SwapExactIn<'info> {
     pub pool: Account<'info, Pool>,
 
     /// CHECK: PDA authority signer
+    #[account(
+        seeds = [AUTH_SEED, pool.key().as_ref()],
+        bump = pool.bump_authority
+    )]
     pub pool_authority: UncheckedAccount<'info>,
 
     pub mint_a: Box<InterfaceAccount<'info, Mint>>,
@@ -908,41 +937,6 @@ pub struct SwapExactIn<'info> {
     pub system_program: Program<'info, System>,
 }
 
-#[derive(Accounts)]
-pub struct EmergencyDrain<'info> {
-    #[account(mut)]
-    pub authority: Signer<'info>,
-
-    #[account(
-        mut,
-        has_one = mint_a @ DexError::InvalidMint,
-        has_one = mint_b @ DexError::InvalidMint,
-        has_one = vault_a @ DexError::InvalidVault,
-        has_one = vault_b @ DexError::InvalidVault,
-        constraint = pool.authority == pool_authority.key() @ DexError::InvalidAuthority
-    )]
-    pub pool: Account<'info, Pool>,
-
-    /// CHECK: PDA authority signer
-    pub pool_authority: UncheckedAccount<'info>,
-
-    pub mint_a: Box<InterfaceAccount<'info, Mint>>,
-    pub mint_b: Box<InterfaceAccount<'info, Mint>>,
-
-    #[account(mut)]
-    pub vault_a: Box<InterfaceAccount<'info, TokenAccount>>,
-    #[account(mut)]
-    pub vault_b: Box<InterfaceAccount<'info, TokenAccount>>,
-
-    #[account(mut)]
-    pub dest_ata_a: Box<InterfaceAccount<'info, TokenAccount>>,
-    #[account(mut)]
-    pub dest_ata_b: Box<InterfaceAccount<'info, TokenAccount>>,
-
-    pub token_program_a: Interface<'info, TokenInterface>,
-    pub token_program_b: Interface<'info, TokenInterface>,
-}
-
 // =============================
 // STATE
 // =============================
@@ -963,6 +957,9 @@ pub struct Pool {
     pub lp_mint: Pubkey,
     pub lp_token_program: Pubkey,
 
+    // ✅ NEW: canonical LP vault ATA that receives MIN_LP_LOCK
+    pub lp_vault: Pubkey,
+
     pub fee_bps: u16,
 
     pub whitelist_required: bool,
@@ -981,6 +978,7 @@ impl Pool {
         32 + 32 + // vault_a, vault_b
         32 + 32 + // token_program_a, token_program_b
         32 + 32 + // lp_mint, lp_token_program
+        32 + // ✅ lp_vault
         2 + // fee_bps
         1 + 1 + 1 + // whitelist_required, paused_swaps, paused_liquidity
         1 + 1; // bumps
@@ -1040,6 +1038,56 @@ fn enforce_pool_invariants<'info>(
     vault_a: &InterfaceAccount<'info, TokenAccount>,
     vault_b: &InterfaceAccount<'info, TokenAccount>,
     lp_mint: &InterfaceAccount<'info, Mint>,
+    lp_vault: &InterfaceAccount<'info, TokenAccount>,
+    token_program_a: &Interface<'info, TokenInterface>,
+    token_program_b: &Interface<'info, TokenInterface>,
+    lp_token_program: &Interface<'info, TokenInterface>,
+) -> Result<()> {
+    // Pool <-> mint/vault keys
+    require_keys_eq!(pool.mint_a, mint_a.key(), DexError::InvalidMint);
+    require_keys_eq!(pool.mint_b, mint_b.key(), DexError::InvalidMint);
+
+    require_keys_eq!(pool.vault_a, vault_a.key(), DexError::InvalidVault);
+    require_keys_eq!(pool.vault_b, vault_b.key(), DexError::InvalidVault);
+
+    require_keys_eq!(pool.lp_mint, lp_mint.key(), DexError::InvalidLpMint);
+    require_keys_eq!(pool.lp_vault, lp_vault.key(), DexError::InvalidLpVault);
+
+    // ✅ Mint program owners
+    require_mint_program(mint_a, token_program_a)?;
+    require_mint_program(mint_b, token_program_b)?;
+    require_mint_program(lp_mint, lp_token_program)?;
+
+    // ✅ Token account program owners (this is what you asked to fix)
+    require_token_account_program(vault_a, token_program_a)?;
+    require_token_account_program(vault_b, token_program_b)?;
+    require_token_account_program(lp_vault, lp_token_program)?;
+
+    // Mint fields inside token accounts
+    require_keys_eq!(vault_a.mint, mint_a.key(), DexError::InvalidVault);
+    require_keys_eq!(vault_b.mint, mint_b.key(), DexError::InvalidVault);
+    require_keys_eq!(lp_vault.mint, lp_mint.key(), DexError::InvalidLpVault);
+
+    // Authority/owner fields inside token accounts
+    require_keys_eq!(vault_a.owner, pool_authority.key(), DexError::InvalidVault);
+    require_keys_eq!(vault_b.owner, pool_authority.key(), DexError::InvalidVault);
+    require_keys_eq!(lp_vault.owner, pool_authority.key(), DexError::InvalidLpVault);
+
+    Ok(())
+}
+
+
+fn enforce_pool_invariants_lite<'info>(
+    pool: &Account<'info, Pool>,
+    pool_authority: &UncheckedAccount<'info>,
+    mint_a: &InterfaceAccount<'info, Mint>,
+    mint_b: &InterfaceAccount<'info, Mint>,
+    vault_a: &InterfaceAccount<'info, TokenAccount>,
+    vault_b: &InterfaceAccount<'info, TokenAccount>,
+    lp_mint: &InterfaceAccount<'info, Mint>,
+    token_program_a: &Interface<'info, TokenInterface>,
+    token_program_b: &Interface<'info, TokenInterface>,
+    lp_token_program: &Interface<'info, TokenInterface>,
 ) -> Result<()> {
     require_keys_eq!(pool.mint_a, mint_a.key(), DexError::InvalidMint);
     require_keys_eq!(pool.mint_b, mint_b.key(), DexError::InvalidMint);
@@ -1055,6 +1103,12 @@ fn enforce_pool_invariants<'info>(
 
     require_keys_eq!(pool.lp_mint, lp_mint.key(), DexError::InvalidLpMint);
 
+    require_mint_program(mint_a, token_program_a)?;
+    require_mint_program(mint_b, token_program_b)?;
+    require_mint_program(lp_mint, lp_token_program)?;
+    
+    require_token_account_program(vault_a, token_program_a)?;
+    require_token_account_program(vault_b, token_program_b)?;
     Ok(())
 }
 
@@ -1076,6 +1130,11 @@ fn validate_whitelist_if_required<'info>(
     );
 
     require_keys_eq!(wl_acc.key(), expected, DexError::NotWhitelisted);
+    require_keys_eq!(
+        *wl_acc.to_account_info().owner,
+        *program_id,
+        DexError::NotWhitelisted
+    );    
 
     // ✅ FIX: deserialize directly from account data (no Account<..> wrapper, no lifetime issues)
     let wl_info = wl_acc.to_account_info();
@@ -1092,6 +1151,70 @@ fn validate_whitelist_if_required<'info>(
     Ok(())
 }
 
+fn validate_token_2022_mint(mint_info: &AccountInfo) -> Result<()> {
+    let data = mint_info.try_borrow_data()?;
+    let mint_ext =
+        StateWithExtensions::<Token2022Mint>::unpack(&data)
+            .map_err(|_| DexError::InvalidToken2022Mint)?;
+
+    let extensions = mint_ext
+        .get_extension_types()
+        .map_err(|_| DexError::InvalidToken2022Mint)?;
+
+    for ext in extensions {
+        match ext {
+            // ❌ EXTENSIONS THAT REQUIRE REMAINING ACCOUNTS (POOL-BRICKING)
+            ExtensionType::TransferHook
+            | ExtensionType::ConfidentialTransferMint
+            | ExtensionType::ConfidentialTransferAccount
+            | ExtensionType::DefaultAccountState
+            | ExtensionType::InterestBearingConfig => {
+                return err!(DexError::UnsupportedToken2022Extension);
+            }
+
+            // ❌ ADMIN / AUTHORITY RISK
+            ExtensionType::PermanentDelegate => {
+                return err!(DexError::UnsupportedToken2022Extension);
+            }
+
+            // ✅ SAFE / PUMP.FUN-COMPATIBLE
+            ExtensionType::TransferFeeConfig
+            | ExtensionType::MetadataPointer
+            | ExtensionType::MintCloseAuthority => {}
+
+            // ❌ DEFAULT DENY (future-proof)
+            _ => {
+                return err!(DexError::UnsupportedToken2022Extension);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn require_token_account_program<'info>(
+    token_acc: &InterfaceAccount<'info, TokenAccount>,
+    token_program: &Interface<'info, TokenInterface>,
+) -> Result<()> {
+    require_keys_eq!(
+        *token_acc.to_account_info().owner,
+        token_program.key(),
+        DexError::WrongTokenProgram
+    );
+    Ok(())
+}
+
+fn require_mint_program<'info>(
+    mint: &InterfaceAccount<'info, Mint>,
+    token_program: &Interface<'info, TokenInterface>,
+) -> Result<()> {
+    require_keys_eq!(
+        *mint.to_account_info().owner,
+        token_program.key(),
+        DexError::WrongTokenProgram
+    );
+    Ok(())
+}
 
 fn integer_sqrt(x: u128) -> Result<u128> {
     if x == 0 {
@@ -1227,4 +1350,10 @@ pub enum DexError {
     InvalidMintOrder,
     #[msg("Invariant violation")]
     InvariantViolation,
+    #[msg("Invalid Token-2022 mint data")]
+    InvalidToken2022Mint,
+    #[msg("Unsupported Token-2022 extension (fee/hook not allowed)")]
+    UnsupportedToken2022Extension,
+    #[msg("Invalid LP vault")]
+    InvalidLpVault,
 }
